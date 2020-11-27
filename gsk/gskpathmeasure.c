@@ -20,6 +20,7 @@
 #include "config.h"
 
 #include "gskpathmeasure.h"
+#include "gskpathbuilder.h"
 
 #include "gskpathbuilder.h"
 #include "gskpathprivate.h"
@@ -442,7 +443,6 @@ gsk_path_measure_in_fill (GskPathMeasure   *self,
       g_assert_not_reached ();
     }
 }
-
 
 /**
  * gsk_path_builder_add_segment:
