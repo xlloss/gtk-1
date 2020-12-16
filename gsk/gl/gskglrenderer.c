@@ -16,6 +16,7 @@
 #include "gskglrenderopsprivate.h"
 #include "gskcairoblurprivate.h"
 #include "gskglshadowcacheprivate.h"
+#include "gskglpathcacheprivate.h"
 #include "gskglnodesampleprivate.h"
 #include "gsktransform.h"
 #include "glutilsprivate.h"
@@ -542,6 +543,7 @@ struct _GskGLRenderer
   GskGLGlyphCache *glyph_cache;
   GskGLIconCache *icon_cache;
   GskGLShadowCache shadow_cache;
+  GskGLPathCache path_cache;
 
 #ifdef G_ENABLE_DEBUG
   struct {
@@ -2831,7 +2833,8 @@ render_fill_node (GskGLRenderer   *self,
   GskRenderNode *child = gsk_fill_node_get_child (node);
   TextureRegion child_region;
   gboolean is_offscreen1;
-  GdkTexture *mask;
+  GskPath *path;
+  GskFillRule fill_rule;
   graphene_rect_t mask_bounds;
   int mask_texture_id;
   OpMask *op;
@@ -2846,18 +2849,36 @@ render_fill_node (GskGLRenderer   *self,
       return;
     }
 
-  /* TODO: cache masks, and apply scale */
-  mask = make_path_mask (gsk_fill_node_get_path (node),
-                         gsk_fill_node_get_fill_rule (node),
-                         &mask_bounds);
+  /* TODO: apply scale */
+  path = gsk_fill_node_get_path (node);
+  fill_rule = gsk_fill_node_get_fill_rule (node);
+  mask_texture_id = gsk_gl_path_cache_get_texture_id (&self->path_cache,
+                                                      path,
+                                                      fill_rule,
+                                                      NULL,
+                                                      &mask_bounds);
+  if (mask_texture_id == 0)
+    {
+      GdkTexture *mask;
 
-  mask_texture_id =
-      gsk_gl_driver_get_texture_for_texture (self->gl_driver,
-                                             mask,
-                                             GL_LINEAR,
-                                             GL_LINEAR);
+      mask = make_path_mask (path, fill_rule, &mask_bounds);
 
-  g_object_unref (mask);
+      mask_texture_id =
+          gsk_gl_driver_get_texture_for_texture (self->gl_driver,
+                                                 mask,
+                                                 GL_LINEAR,
+                                                 GL_LINEAR);
+
+      gsk_gl_driver_mark_texture_permanent (self->gl_driver, mask_texture_id);
+      gsk_gl_path_cache_commit (&self->path_cache,
+                                path,
+                                fill_rule,
+                                NULL,
+                                mask_texture_id,
+                                &mask_bounds);
+
+      g_object_unref (mask);
+    }
 
   ops_set_program (builder, &self->programs->mask_program);
 
@@ -2882,7 +2903,7 @@ render_stroke_node (GskGLRenderer   *self,
   TextureRegion child_region;
   gboolean is_offscreen1;
   GskPath *path;
-  GdkTexture *mask;
+  GskStroke *stroke;
   int mask_texture_id;
   graphene_rect_t mask_bounds;
   OpMask *op;
@@ -2897,19 +2918,39 @@ render_stroke_node (GskGLRenderer   *self,
       return;
     }
 
-  /* TODO: cache masks, and apply scale */
-  path = gsk_path_stroke (gsk_stroke_node_get_path (node),
-                          (GskStroke *)gsk_stroke_node_get_stroke (node));
-  mask = make_path_mask (path, GSK_FILL_RULE_WINDING, &mask_bounds);
+  /* TODO: apply scale */
+  path = gsk_stroke_node_get_path (node);
+  stroke = (GskStroke *)gsk_stroke_node_get_stroke (node);
 
-  mask_texture_id =
-      gsk_gl_driver_get_texture_for_texture (self->gl_driver,
-                                             mask,
-                                             GL_LINEAR,
-                                             GL_LINEAR);
+  mask_texture_id = gsk_gl_path_cache_get_texture_id (&self->path_cache,
+                                                      path,
+                                                      GSK_FILL_RULE_WINDING,
+                                                      stroke,
+                                                      &mask_bounds);
+  if (mask_texture_id == 0)
+    {
+      GskPath *stroke_path;
+      GdkTexture *mask;
 
-  g_object_unref (mask);
-  gsk_path_unref (path);
+      stroke_path = gsk_path_stroke (path, stroke);
+      mask = make_path_mask (stroke_path, GSK_FILL_RULE_WINDING, &mask_bounds);
+
+      mask_texture_id =
+          gsk_gl_driver_get_texture_for_texture (self->gl_driver,
+                                                 mask,
+                                                 GL_LINEAR,
+                                                 GL_LINEAR);
+
+      gsk_gl_driver_mark_texture_permanent (self->gl_driver, mask_texture_id);
+      gsk_gl_path_cache_commit (&self->path_cache,
+                                path,
+                                GSK_FILL_RULE_WINDING,
+                                stroke,
+                                mask_texture_id,
+                                &mask_bounds);
+      g_object_unref (mask);
+      gsk_path_unref (stroke_path);
+    }
 
   ops_set_program (builder, &self->programs->mask_program);
 
@@ -3798,6 +3839,7 @@ gsk_gl_renderer_realize (GskRenderer  *renderer,
   self->glyph_cache = get_glyph_cache_for_display (gdk_surface_get_display (surface), self->atlases);
   self->icon_cache = get_icon_cache_for_display (gdk_surface_get_display (surface), self->atlases);
   gsk_gl_shadow_cache_init (&self->shadow_cache);
+  gsk_gl_path_cache_init (&self->path_cache);
 
   gdk_profiler_end_mark (before, "gl renderer realize", NULL);
 
@@ -3825,6 +3867,7 @@ gsk_gl_renderer_unrealize (GskRenderer *renderer)
   g_clear_pointer (&self->icon_cache, gsk_gl_icon_cache_unref);
   g_clear_pointer (&self->atlases, gsk_gl_texture_atlases_unref);
   gsk_gl_shadow_cache_free (&self->shadow_cache, self->gl_driver);
+  gsk_gl_path_cache_free (&self->path_cache, self->gl_driver);
 
   g_clear_object (&self->gl_profiler);
   g_clear_object (&self->gl_driver);
@@ -4472,6 +4515,7 @@ gsk_gl_renderer_do_render (GskRenderer           *renderer,
   gsk_gl_glyph_cache_begin_frame (self->glyph_cache, self->gl_driver, removed);
   gsk_gl_icon_cache_begin_frame (self->icon_cache, removed);
   gsk_gl_shadow_cache_begin_frame (&self->shadow_cache, self->gl_driver);
+  gsk_gl_path_cache_begin_frame (&self->path_cache, self->gl_driver);
   g_ptr_array_unref (removed);
 
   /* Set up the modelview and projection matrices to fit our viewport */
